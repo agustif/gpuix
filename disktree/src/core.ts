@@ -144,7 +144,8 @@ export async function scan(root: string, options: ScanOptions): Promise<TreeNode
   // Directories listed by a parent, waiting for their own record.
   const open = new Map<string, TreeNode>([[root, tree]])
   const queue: string[] = [root]
-  const seen = new Set<string>()
+  // Use numeric keys for seen hardlinks instead of strings: Map<dev, Set<ino>>
+  const seen = new Map<number, Set<number>>()
   const size = Math.max(2, Math.min(4, availableParallelism() - 2))
   // tsc rewrites import specifiers, not URL strings: src loads .ts, dist loads .js.
   const workerUrl = new URL(`./scan-worker${path.extname(import.meta.url)}`, import.meta.url)
@@ -163,8 +164,17 @@ export async function scan(root: string, options: ScanOptions): Promise<TreeNode
       // Two names for one inode cost one file.
       const charge = ([, bytes, apparent, , link]: FileRecord) => {
         if (!link) return [bytes, apparent]
-        if (seen.has(link)) return [0, 0]
-        seen.add(link)
+        // Parse "dev:ino" into numeric parts
+        const colon = link.indexOf(':')
+        const dev = parseInt(link.slice(0, colon), 10)
+        const ino = parseInt(link.slice(colon + 1), 10)
+        let devSet = seen.get(dev)
+        if (!devSet) {
+          devSet = new Set()
+          seen.set(dev, devSet)
+        }
+        if (devSet.has(ino)) return [0, 0]
+        devSet.add(ino)
         return [bytes, apparent]
       }
       for (const file of record.files) {
@@ -191,7 +201,10 @@ export async function scan(root: string, options: ScanOptions): Promise<TreeNode
         open.set(path.join(record.path, name), child)
       }
     }
-    queue.push(...reply.pending)
+    // Avoid spreading large arrays in a single push call
+    for (const pending of reply.pending) {
+      queue.push(pending)
+    }
   }
 
   try {
