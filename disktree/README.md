@@ -37,9 +37,10 @@ Runs on Node 20+ or Bun (`bunx disktree`). No Electron, no web view: GPUI paints
 ## How it scans
 
 A pool of up to four worker threads walks the tree with synchronous `lstat`, one volume
-only, hardlinks counted once. Each directory keeps its 12 largest files as
-tiles and folds the rest into one "N smaller files" tile, which keeps a
-full-disk scan in memory.
+only, hardlinks counted once. Each directory keeps its 12 largest files of at
+least 64 KiB as tiles and folds the rest into one "N smaller files" tile, which
+keeps a full-disk scan in memory: a home folder has millions of directories of
+tiny files (`node_modules`, caches, `.git`), and a tile per file would not fit.
 
 `/System/Volumes/Data` is skipped when scanning `/`, since it mirrors `/Users`
 and `/Applications`.

@@ -21,8 +21,11 @@ export interface ScanRequest {
   skip: string[]
 }
 
-/** name, disk bytes, apparent bytes, mtime ms, hardlink key or '' */
-export type FileRecord = [string, number, number, number, string]
+/**
+ * name, disk bytes, apparent bytes, mtime ms, inode when hardlinked or 0.
+ * A scan stays on one device, so the inode alone identifies a hardlink.
+ */
+export type FileRecord = [string, number, number, number, number]
 
 export interface DirRecord {
   path: string
@@ -31,7 +34,17 @@ export interface DirRecord {
   /** The largest files, one node each. */
   files: FileRecord[]
   /** Everything else, folded into one total. */
-  folded: { count: number; bytes: number; apparent: number; modified: number; links: FileRecord[] } | null
+  folded: {
+    count: number
+    bytes: number
+    apparent: number
+    modified: number
+    /**
+     * Hardlinked files in the total, flat as disk bytes, apparent bytes,
+     * inode: one message per batch can carry thousands of them.
+     */
+    links: number[]
+  } | null
   /** Subdirectories to be scanned; their records follow here or in a later batch. */
   dirs: string[]
 }
@@ -45,6 +58,14 @@ export interface ScanReply {
 const BUDGET = 400
 /** Files kept as their own tile per directory; the rest cannot be seen anyway. */
 export const KEEP_FILES = 12
+/**
+ * Smaller files are folded even when there is room for them. Every kept file
+ * becomes a tree node on the main thread that lives as long as the window, and
+ * a home folder has millions of directories full of tiny files (node_modules,
+ * caches, .git): at up to 13 nodes per directory the tree can outgrow V8's
+ * default heap. A file this small is a sliver of any folder worth looking at.
+ */
+export const MIN_FILE_BYTES = 64 * 1024
 
 function scanBatch(request: ScanRequest): ScanReply {
   const devices = new Set(request.devices)
@@ -85,19 +106,22 @@ function scanBatch(request: ScanRequest): ScanReply {
         subdirs.push(name)
         continue
       }
-      const link = stat.nlink > 1 ? `${stat.dev}:${stat.ino}` : ''
-      files.push([name, stat.blocks * 512, stat.size, stat.mtimeMs, link])
+      files.push([name, stat.blocks * 512, stat.size, stat.mtimeMs, stat.nlink > 1 ? stat.ino : 0])
     }
     files.sort((left, right) => right[1] - left[1])
-    record.files = files.slice(0, KEEP_FILES)
-    const rest = files.slice(KEEP_FILES)
+    let keep = 0
+    while (keep < files.length && keep < KEEP_FILES && files[keep]![1] >= MIN_FILE_BYTES) keep++
+    // A fold of one file costs the same node as the file, and keeps its name.
+    if (files.length - keep === 1) keep++
+    record.files = files.slice(0, keep)
+    const rest = files.slice(keep)
     if (rest.length) {
       record.folded = { count: rest.length, bytes: 0, apparent: 0, modified: 0, links: [] }
       for (const file of rest) {
         record.folded.bytes += file[1]
         record.folded.apparent += file[2]
         record.folded.modified = Math.max(record.folded.modified, file[3])
-        if (file[4]) record.folded.links.push(file)
+        if (file[4]) record.folded.links.push(file[1], file[2], file[4])
       }
     }
     record.dirs = subdirs

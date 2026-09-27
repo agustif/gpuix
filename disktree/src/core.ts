@@ -15,7 +15,7 @@ import os, { availableParallelism } from 'node:os'
 import path from 'node:path'
 import { Worker } from 'node:worker_threads'
 
-import type { FileRecord, ScanReply } from './scan-worker.ts'
+import type { ScanReply } from './scan-worker.ts'
 
 // ── Tree ───────────────────────────────────────────────────────────────────
 
@@ -107,6 +107,9 @@ export interface ScanOptions {
 // `/`, and the same volume is also mounted here. Walking both counts it twice.
 const MIRRORS = process.platform === 'darwin' ? ['/System/Volumes/Data'] : []
 
+// Files never get children; one shared frozen array instead of one per file.
+const NO_CHILDREN = Object.freeze([]) as unknown as TreeNode[]
+
 function leaf(name: string, bytes: number, apparent: number, modified: number, files = 1): TreeNode {
   return {
     name,
@@ -116,15 +119,23 @@ function leaf(name: string, bytes: number, apparent: number, modified: number, f
     files,
     dirs: 0,
     modified,
-    children: [],
+    children: NO_CHILDREN,
     category: 'other',
     reclaim: null,
     unreadable: false,
   }
 }
 
+// One label string per count, not one per directory.
+const smallerLabels = new Map<number, string>()
+function smallerFiles(count: number): string {
+  let label = smallerLabels.get(count)
+  if (label === undefined) smallerLabels.set(count, (label = `${count} smaller files`))
+  return label
+}
+
 function folder(name: string): TreeNode {
-  return { ...leaf(name, 0, 0, 0, 0), dir: true }
+  return { ...leaf(name, 0, 0, 0, 0), dir: true, children: [] }
 }
 
 /**
@@ -144,7 +155,15 @@ export async function scan(root: string, options: ScanOptions): Promise<TreeNode
   // Directories listed by a parent, waiting for their own record.
   const open = new Map<string, TreeNode>([[root, tree]])
   const queue: string[] = [root]
-  const seen = new Set<string>()
+  // Inodes of hardlinked files already charged. One device, so the inode is enough.
+  const seen = new Set<number>()
+  // Two names for one inode cost one file: true the first time an inode shows up.
+  const firstName = (ino: number) => {
+    if (!ino) return true
+    if (seen.has(ino)) return false
+    seen.add(ino)
+    return true
+  }
   const size = Math.max(2, Math.min(4, availableParallelism() - 2))
   // tsc rewrites import specifiers, not URL strings: src loads .ts, dist loads .js.
   const workerUrl = new URL(`./scan-worker${path.extname(import.meta.url)}`, import.meta.url)
@@ -160,36 +179,36 @@ export async function scan(root: string, options: ScanOptions): Promise<TreeNode
       progress.dirs++
       node.modified = record.modified
       node.unreadable = record.unreadable
-      // Two names for one inode cost one file.
-      const charge = ([, bytes, apparent, , link]: FileRecord) => {
-        if (!link) return [bytes, apparent]
-        if (seen.has(link)) return [0, 0]
-        seen.add(link)
-        return [bytes, apparent]
-      }
-      for (const file of record.files) {
-        const [bytes, apparent] = charge(file)
-        node.children.push(leaf(file[0], bytes!, apparent!, file[3]))
+      // Sized up front: a pushed-to array reserves room for 16 children, and
+      // most directories end up with a handful.
+      const children: TreeNode[] = new Array(record.files.length + (record.folded ? 1 : 0) + record.dirs.length)
+      let slot = 0
+      for (const [name, fileBytes, fileApparent, modified, ino] of record.files) {
+        const counted = firstName(ino)
+        const bytes = counted ? fileBytes : 0
+        children[slot++] = leaf(name, bytes, counted ? fileApparent : 0, modified)
         progress.files++
-        progress.bytes += bytes!
+        progress.bytes += bytes
       }
       const folded = record.folded
       if (folded) {
         let { bytes, apparent } = folded
-        for (const link of folded.links) {
-          const [kept, keptApparent] = charge(link)
-          bytes -= link[1] - kept!
-          apparent -= link[2] - keptApparent!
+        const links = folded.links
+        for (let index = 0; index < links.length; index += 3) {
+          if (firstName(links[index + 2]!)) continue
+          bytes -= links[index]!
+          apparent -= links[index + 1]!
         }
-        node.children.push(leaf(`${folded.count} smaller files`, bytes, apparent, folded.modified, folded.count))
+        children[slot++] = leaf(smallerFiles(folded.count), bytes, apparent, folded.modified, folded.count)
         progress.files += folded.count
         progress.bytes += bytes
       }
       for (const name of record.dirs) {
         const child = folder(name)
-        node.children.push(child)
+        children[slot++] = child
         open.set(path.join(record.path, name), child)
       }
+      node.children = children
     }
     queue.push(...reply.pending)
   }
